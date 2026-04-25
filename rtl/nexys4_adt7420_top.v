@@ -2,13 +2,22 @@
 //  nexys4_adt7420_top.v
 //  Top-level del sistema I2C + ADT7420 para Nexys 4 DDR
 //
-//  Correcciones importantes:
-//    1. El display ya NO invierte los bits SEG en el top.
-//       Ahora seven_seg_driver usa el mismo orden que el XDC:
-//       SEG[0]=CA, SEG[1]=CB, ..., SEG[6]=CG.
+//  Función:
+//    - Controla el core OpenCores I2C mediante Wishbone.
+//    - Lee la temperatura del ADT7420 integrado.
+//    - Convierte el dato crudo a BCD.
+//    - Muestra la temperatura en display de 7 segmentos.
+//    - Saca señales internas por PMOD_DBG[7:0] para osciloscopio.
 //
-//    2. Se separa temp_sign_raw de bcd_sign.
-//       Antes había riesgo de dos drivers sobre la misma señal.
+//  Señales PMOD_DBG:
+//    PMOD_DBG[0] = SCL leído desde el pin I2C
+//    PMOD_DBG[1] = SDA leído desde el pin I2C
+//    PMOD_DBG[2] = core intentando manejar SCL en bajo
+//    PMOD_DBG[3] = core intentando manejar SDA en bajo
+//    PMOD_DBG[4] = transacción I2C activa
+//    PMOD_DBG[5] = data_valid estirado
+//    PMOD_DBG[6] = wb_ack
+//    PMOD_DBG[7] = error_code != 0
 // ================================================================
 
 module nexys4_adt7420_top (
@@ -25,13 +34,16 @@ module nexys4_adt7420_top (
     output wire [7:0]  AN,
 
     // LEDs de debug
-    output wire [7:0]  LED
+    output wire [7:0]  LED,
+
+    // Salidas de depuración hacia PMOD JA
+    output wire [7:0]  PMOD_DBG
 );
 
     // ============================================================
     // Reset
     // BTNC es activo alto físicamente.
-    // El sistema interno usa rst_n activo bajo.
+    // Internamente usamos rst_n activo bajo.
     // ============================================================
     wire rst_n = ~BTNC;
 
@@ -168,11 +180,10 @@ module nexys4_adt7420_top (
     );
 
     // ============================================================
-    // Display 7 segmentos
+    // Driver display 7 segmentos
     //
     // IMPORTANTE:
-    // Aquí ya NO se invierte SEG.
-    // El seven_seg_driver corregido ya entrega:
+    // Este top asume que seven_seg_driver ya entrega:
     //
     // SEG[0] = CA
     // SEG[1] = CB
@@ -181,6 +192,8 @@ module nexys4_adt7420_top (
     // SEG[4] = CE
     // SEG[5] = CF
     // SEG[6] = CG
+    //
+    // Por eso aquí NO se invierte el bus SEG.
     // ============================================================
     seven_seg_driver seg_drv (
         .clk            (CLK100MHZ),
@@ -207,5 +220,62 @@ module nexys4_adt7420_top (
     assign LED[5]   = wb_inta;
     assign LED[6]   = temp_sign_raw;
     assign LED[7]   = |fsm_state;
+
+    // ============================================================
+    // Señal data_valid estirada para osciloscopio
+    //
+    // data_valid original dura 1 ciclo de reloj:
+    // 1 ciclo @ 100 MHz = 10 ns
+    //
+    // Eso es muy estrecho para verlo cómodamente en osciloscopio.
+    // Aquí se estira a ~5 ms.
+    // ============================================================
+    reg [19:0] data_valid_cnt;
+
+    always @(posedge CLK100MHZ or negedge rst_n) begin
+        if (!rst_n) begin
+            data_valid_cnt <= 20'd0;
+        end else begin
+            if (data_valid)
+                data_valid_cnt <= 20'd500_000;   // ~5 ms @ 100 MHz
+            else if (data_valid_cnt != 20'd0)
+                data_valid_cnt <= data_valid_cnt - 20'd1;
+        end
+    end
+
+    wire data_valid_dbg = (data_valid_cnt != 20'd0);
+
+    // FSM en transacción I2C.
+    // En tu controlador, los estados de transacción van aprox. de 10 a 28.
+    wire i2c_active_dbg = (fsm_state >= 6'd10) && (fsm_state <= 6'd28);
+
+    // ============================================================
+    // Bus de depuración
+    // ============================================================
+    wire [7:0] debug_bus;
+
+    assign debug_bus[0] = scl_pad_i;              // SCL real leído desde el pin
+    assign debug_bus[1] = sda_pad_i;              // SDA real leído desde el pin
+
+    assign debug_bus[2] = ~scl_padoen_o;          // 1 = core maneja SCL en bajo
+    assign debug_bus[3] = ~sda_padoen_o;          // 1 = core maneja SDA en bajo
+
+    assign debug_bus[4] = i2c_active_dbg;         // transacción I2C activa
+    assign debug_bus[5] = data_valid_dbg;         // data_valid estirado
+    assign debug_bus[6] = wb_ack;                 // ACK Wishbone
+    assign debug_bus[7] = (error_code != 4'd0);   // error I2C
+
+    // ============================================================
+    // Dos NOT por cada señal antes de salir al PMOD
+    // ============================================================
+    genvar i;
+    generate
+        for (i = 0; i < 8; i = i + 1) begin : GEN_DEBUG_BUFFERS
+            debug_not2_buffer u_debug_buf (
+                .sig_in  (debug_bus[i]),
+                .sig_out (PMOD_DBG[i])
+            );
+        end
+    endgenerate
 
 endmodule
